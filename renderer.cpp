@@ -61,6 +61,7 @@ struct RendererState {
     int height = 1;
     float orbitYaw = 0.78f;
     float orbitPitch = -0.48f;
+    float zoomDistance = 3.0f;
     bool dragging = false;
     POINT lastMouse{};
 };
@@ -311,6 +312,19 @@ void UploadModel(RendererState& state, const ModelData& model) {
 }
 
 bool InitializeRenderer(HWND window, RendererState& state) {
+    auto fail = [&]() {
+        if (state.renderContext != nullptr) {
+            wglMakeCurrent(nullptr, nullptr);
+            wglDeleteContext(state.renderContext);
+            state.renderContext = nullptr;
+        }
+        if (state.deviceContext != nullptr) {
+            ReleaseDC(window, state.deviceContext);
+            state.deviceContext = nullptr;
+        }
+        return false;
+    };
+
     state.deviceContext = GetDC(window);
     PIXELFORMATDESCRIPTOR pfd{};
     pfd.nSize = sizeof(pfd);
@@ -323,7 +337,7 @@ bool InitializeRenderer(HWND window, RendererState& state) {
 
     const int pixelFormat = ChoosePixelFormat(state.deviceContext, &pfd);
     if (pixelFormat == 0 || !SetPixelFormat(state.deviceContext, pixelFormat, &pfd)) {
-        return false;
+        return fail();
     }
 
     EnsureWglCreateContextLoaded();
@@ -341,16 +355,16 @@ bool InitializeRenderer(HWND window, RendererState& state) {
         state.renderContext = wglCreateContext(state.deviceContext);
     }
     if (state.renderContext == nullptr || !wglMakeCurrent(state.deviceContext, state.renderContext)) {
-        return false;
+        return fail();
     }
 
     if (!LoadModernFunctions()) {
-        return false;
+        return fail();
     }
 
     state.program = CreateProgram();
     if (state.program == 0) {
-        return false;
+        return fail();
     }
 
     glGenVertexArraysFn(1, &state.vao);
@@ -371,26 +385,29 @@ bool InitializeRenderer(HWND window, RendererState& state) {
 }
 
 void DestroyRenderer(RendererState& state) {
-    if (state.deviceContext == nullptr || state.renderContext == nullptr) {
-        return;
+    if (state.deviceContext != nullptr && state.renderContext != nullptr) {
+        wglMakeCurrent(state.deviceContext, state.renderContext);
+        if (state.program != 0) {
+            glDeleteProgramFn(state.program);
+        }
+        if (state.vertexBuffer != 0) {
+            glDeleteBuffersFn(1, &state.vertexBuffer);
+        }
+        if (state.indexBuffer != 0) {
+            glDeleteBuffersFn(1, &state.indexBuffer);
+        }
+        if (state.vao != 0) {
+            glDeleteVertexArraysFn(1, &state.vao);
+        }
+        wglMakeCurrent(nullptr, nullptr);
+        wglDeleteContext(state.renderContext);
+        state.renderContext = nullptr;
     }
 
-    wglMakeCurrent(state.deviceContext, state.renderContext);
-    if (state.program != 0) {
-        glDeleteProgramFn(state.program);
+    if (state.deviceContext != nullptr) {
+        ReleaseDC(WindowFromDC(state.deviceContext), state.deviceContext);
+        state.deviceContext = nullptr;
     }
-    if (state.vertexBuffer != 0) {
-        glDeleteBuffersFn(1, &state.vertexBuffer);
-    }
-    if (state.indexBuffer != 0) {
-        glDeleteBuffersFn(1, &state.indexBuffer);
-    }
-    if (state.vao != 0) {
-        glDeleteVertexArraysFn(1, &state.vao);
-    }
-    wglMakeCurrent(nullptr, nullptr);
-    wglDeleteContext(state.renderContext);
-    state.renderContext = nullptr;
 }
 
 void Render(RendererState& state) {
@@ -406,7 +423,7 @@ void Render(RendererState& state) {
     glUseProgramFn(state.program);
     const float aspect = static_cast<float>(std::max(1, state.width)) / static_cast<float>(std::max(1, state.height));
     const Mat4 projection = Perspective(1.0f, aspect, 0.1f, 20.0f);
-    const Mat4 view = Translation(0.0f, 0.0f, -3.0f);
+    const Mat4 view = Translation(0.0f, 0.0f, -state.zoomDistance);
     const Mat4 model = Multiply(RotationY(state.orbitYaw), RotationX(state.orbitPitch));
     const Mat4 mvp = Multiply(projection, Multiply(view, model));
 
@@ -450,6 +467,7 @@ LRESULT CALLBACK ViewportProc(HWND window, UINT message, WPARAM wParam, LPARAM l
                 state->dragging = true;
                 state->lastMouse.x = MouseXFromLParam(lParam);
                 state->lastMouse.y = MouseYFromLParam(lParam);
+                SetFocus(window);
                 SetCapture(window);
             }
             return 0;
@@ -483,6 +501,16 @@ LRESULT CALLBACK ViewportProc(HWND window, UINT message, WPARAM wParam, LPARAM l
         case WM_CAPTURECHANGED: {
             if (RendererState* state = GetState(window)) {
                 state->dragging = false;
+            }
+            return 0;
+        }
+
+        case WM_MOUSEWHEEL: {
+            if (RendererState* state = GetState(window)) {
+                const float wheelDelta = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)) / static_cast<float>(WHEEL_DELTA);
+                state->zoomDistance -= wheelDelta * 0.22f;
+                state->zoomDistance = std::clamp(state->zoomDistance, 1.1f, 8.0f);
+                InvalidateRect(window, nullptr, FALSE);
             }
             return 0;
         }

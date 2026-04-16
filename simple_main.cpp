@@ -9,6 +9,7 @@
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <memory>
 #include <string>
 
 #define NOMINMAX
@@ -344,7 +345,7 @@ void StartAnalysis() {
         return;
     }
 
-    const ModelData modelCopy = gApp.model;
+    const auto modelCopy = std::make_shared<ModelData>(gApp.model);
     const ConversionMethod method = CurrentMethod();
     const unsigned long long revision = gApp.modelRevision;
     gApp.showingPreview = false;
@@ -356,7 +357,7 @@ void StartAnalysis() {
     gApp.fitFuture = std::async(std::launch::async, [modelCopy, method, revision]() {
         AsyncFitResult result;
         result.revision = revision;
-        result.fit = AnalyzeModel(modelCopy, method);
+        result.fit = AnalyzeModel(*modelCopy, method);
         return result;
     });
 }
@@ -366,7 +367,7 @@ void StartMarchingCubes() {
         return;
     }
 
-    const ModelData modelCopy = gApp.model;
+    const auto modelCopy = std::make_shared<ModelData>(gApp.model);
     const ConversionMethod method = CurrentMethod();
     const unsigned long long revision = gApp.modelRevision;
     gApp.previewRunning = true;
@@ -376,7 +377,7 @@ void StartMarchingCubes() {
     gApp.previewFuture = std::async(std::launch::async, [modelCopy, method, revision]() {
         AsyncMarchingResult result;
         result.revision = revision;
-        result.preview = GenerateMarchingCubesPreview(modelCopy, method);
+        result.preview = GenerateMarchingCubesPreview(*modelCopy, method);
         return result;
     });
 }
@@ -639,7 +640,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 MarkDirty();
                 return 0;
             }
-            return 0;
+            break;
         }
 
         case WM_DESTROY:

@@ -11,9 +11,21 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
+#ifndef MODEL_DOWNSCALE_ENABLED
+#define MODEL_DOWNSCALE_ENABLED 0
+#endif
+
+#ifndef MODEL_GPU_COMPUTE_ENABLED
+#define MODEL_GPU_COMPUTE_ENABLED 0
+#endif
+
 namespace {
+
+[[maybe_unused]] constexpr bool kDownscaleBuild = MODEL_DOWNSCALE_ENABLED != 0;
+[[maybe_unused]] constexpr bool kGpuComputeBuild = MODEL_GPU_COMPUTE_ENABLED != 0;
 
 struct Vec3d {
     double x = 0.0;
@@ -54,6 +66,28 @@ struct FittingSample {
     Vec3d point;
     double target = 0.0;
     double weight = 1.0;
+};
+
+struct RbfFitSettings {
+    std::size_t minCenterCount = 64;
+    std::size_t maxCenterCount = 192;
+    std::size_t centerDivisor = 6000;
+    std::size_t centerCandidateCount = 18000;
+    std::size_t surfaceCandidateCount = 24000;
+    std::size_t surfaceSampleBase = 1800;
+    std::size_t surfaceSamplesPerCenter = 24;
+    double radiusScale = 1.3;
+    double minRadius = 0.05;
+    double maxRadius = 0.26;
+};
+
+struct Bounds3d {
+    double minX = 0.0;
+    double minY = 0.0;
+    double minZ = 0.0;
+    double maxX = 0.0;
+    double maxY = 0.0;
+    double maxZ = 0.0;
 };
 
 Vec3d operator+(const Vec3d& left, const Vec3d& right) {
@@ -138,6 +172,7 @@ std::vector<Vec3d> ReadAllVertices(const ModelData& model, bool normalized) {
 }
 
 Vec3d ComputeCentroid(const std::vector<Vec3d>& vertices);
+std::vector<std::size_t> BuildFarthestPointIndices(const std::vector<Vec3d>& points, std::size_t maxCount);
 
 std::vector<std::size_t> BuildSampleIndices(std::size_t totalCount, std::size_t maxCount) {
     if (totalCount == 0) {
@@ -164,6 +199,240 @@ std::vector<std::size_t> BuildSampleIndices(std::size_t totalCount, std::size_t 
         indices.push_back(index);
     }
     return indices;
+}
+
+std::vector<Vec3d> GatherPointsByIndex(const std::vector<Vec3d>& points, const std::vector<std::size_t>& indices) {
+    std::vector<Vec3d> gathered;
+    gathered.reserve(indices.size());
+    for (std::size_t index : indices) {
+        if (index < points.size()) {
+            gathered.push_back(points[index]);
+        }
+    }
+    return gathered;
+}
+
+std::vector<std::size_t> BuildSpatialSampleIndices(const std::vector<Vec3d>& points, std::size_t maxCount) {
+    if (points.empty() || maxCount == 0) {
+        return {};
+    }
+
+    if (points.size() <= maxCount) {
+        std::vector<std::size_t> indices(points.size());
+        std::iota(indices.begin(), indices.end(), 0);
+        return indices;
+    }
+
+    Vec3d minPoint = points.front();
+    Vec3d maxPoint = points.front();
+    for (const Vec3d& point : points) {
+        minPoint.x = std::min(minPoint.x, point.x);
+        minPoint.y = std::min(minPoint.y, point.y);
+        minPoint.z = std::min(minPoint.z, point.z);
+        maxPoint.x = std::max(maxPoint.x, point.x);
+        maxPoint.y = std::max(maxPoint.y, point.y);
+        maxPoint.z = std::max(maxPoint.z, point.z);
+    }
+
+    const double extentX = std::max(maxPoint.x - minPoint.x, 1e-9);
+    const double extentY = std::max(maxPoint.y - minPoint.y, 1e-9);
+    const double extentZ = std::max(maxPoint.z - minPoint.z, 1e-9);
+    const int gridResolution = std::max(2, static_cast<int>(std::ceil(std::cbrt(static_cast<double>(maxCount) * 1.6))));
+    const double stepX = extentX / static_cast<double>(gridResolution);
+    const double stepY = extentY / static_cast<double>(gridResolution);
+    const double stepZ = extentZ / static_cast<double>(gridResolution);
+
+    struct CellRepresentative {
+        std::size_t index = 0;
+        double distanceSquared = std::numeric_limits<double>::max();
+    };
+
+    std::unordered_map<std::uint64_t, CellRepresentative> cells;
+    cells.reserve(maxCount * 2);
+    for (std::size_t index = 0; index < points.size(); ++index) {
+        const Vec3d& point = points[index];
+        const int ix = std::clamp(static_cast<int>(((point.x - minPoint.x) / extentX) * gridResolution), 0, gridResolution - 1);
+        const int iy = std::clamp(static_cast<int>(((point.y - minPoint.y) / extentY) * gridResolution), 0, gridResolution - 1);
+        const int iz = std::clamp(static_cast<int>(((point.z - minPoint.z) / extentZ) * gridResolution), 0, gridResolution - 1);
+        const std::uint64_t key = static_cast<std::uint64_t>(ix)
+            + static_cast<std::uint64_t>(gridResolution) * (static_cast<std::uint64_t>(iy)
+            + static_cast<std::uint64_t>(gridResolution) * static_cast<std::uint64_t>(iz));
+
+        const Vec3d cellCenter{
+            minPoint.x + (static_cast<double>(ix) + 0.5) * stepX,
+            minPoint.y + (static_cast<double>(iy) + 0.5) * stepY,
+            minPoint.z + (static_cast<double>(iz) + 0.5) * stepZ,
+        };
+        const double cellDistanceSquared = DistanceSquared(point, cellCenter);
+
+        auto [iterator, inserted] = cells.try_emplace(key, CellRepresentative{index, cellDistanceSquared});
+        if (!inserted && cellDistanceSquared < iterator->second.distanceSquared) {
+            iterator->second = {index, cellDistanceSquared};
+        }
+    }
+
+    std::vector<std::size_t> indices;
+    indices.reserve(cells.size());
+    for (const auto& entry : cells) {
+        indices.push_back(entry.second.index);
+    }
+
+    if (indices.size() > maxCount) {
+        const std::vector<Vec3d> candidates = GatherPointsByIndex(points, indices);
+        const std::vector<std::size_t> sampledOffsets = BuildFarthestPointIndices(candidates, maxCount);
+        std::vector<std::size_t> reduced;
+        reduced.reserve(sampledOffsets.size());
+        for (std::size_t offset : sampledOffsets) {
+            reduced.push_back(indices[offset]);
+        }
+        indices = std::move(reduced);
+    } else if (indices.size() < maxCount) {
+        std::unordered_map<std::size_t, bool> chosen;
+        chosen.reserve(indices.size() * 2 + 1);
+        for (std::size_t index : indices) {
+            chosen[index] = true;
+        }
+        const std::vector<std::size_t> fallback = BuildSampleIndices(points.size(), maxCount);
+        for (std::size_t index : fallback) {
+            if (chosen.find(index) == chosen.end()) {
+                chosen[index] = true;
+                indices.push_back(index);
+                if (indices.size() >= maxCount) {
+                    break;
+                }
+            }
+        }
+    }
+
+    return indices;
+}
+
+Bounds3d BoundsFromModel(const ModelData& model) {
+    return {
+        static_cast<double>(model.boundsMin[0]),
+        static_cast<double>(model.boundsMin[1]),
+        static_cast<double>(model.boundsMin[2]),
+        static_cast<double>(model.boundsMax[0]),
+        static_cast<double>(model.boundsMax[1]),
+        static_cast<double>(model.boundsMax[2]),
+    };
+}
+
+bool HasMeaningfulExtent(const Bounds3d& bounds) {
+    return (bounds.maxX - bounds.minX) > 1e-6
+        && (bounds.maxY - bounds.minY) > 1e-6
+        && (bounds.maxZ - bounds.minZ) > 1e-6;
+}
+
+Bounds3d ComputeTrimmedVertexBounds(const ModelData& model, std::size_t maxSamples) {
+    if (model.VertexCount() == 0) {
+        return BoundsFromModel(model);
+    }
+
+    const std::vector<std::size_t> spatialSourceIndices = BuildSpatialSampleIndices(ReadAllVertices(model, false), maxSamples);
+    const std::vector<std::size_t>& sampleIndices = spatialSourceIndices;
+    if (sampleIndices.empty()) {
+        return BoundsFromModel(model);
+    }
+
+    std::vector<double> xs;
+    std::vector<double> ys;
+    std::vector<double> zs;
+    xs.reserve(sampleIndices.size());
+    ys.reserve(sampleIndices.size());
+    zs.reserve(sampleIndices.size());
+    for (std::size_t index : sampleIndices) {
+        xs.push_back(static_cast<double>(model.positions[index * 3]));
+        ys.push_back(static_cast<double>(model.positions[index * 3 + 1]));
+        zs.push_back(static_cast<double>(model.positions[index * 3 + 2]));
+    }
+
+    std::sort(xs.begin(), xs.end());
+    std::sort(ys.begin(), ys.end());
+    std::sort(zs.begin(), zs.end());
+
+    const std::size_t trimCount = sampleIndices.size() >= 400 ? sampleIndices.size() / 100 : 0;
+    const std::size_t low = trimCount;
+    const std::size_t high = sampleIndices.size() - 1 - trimCount;
+
+    Bounds3d bounds{
+        xs[low], ys[low], zs[low],
+        xs[high], ys[high], zs[high],
+    };
+    if (!HasMeaningfulExtent(bounds)) {
+        return BoundsFromModel(model);
+    }
+    return bounds;
+}
+
+Bounds3d MergeBounds(const Bounds3d& left, const Bounds3d& right) {
+    return {
+        std::min(left.minX, right.minX),
+        std::min(left.minY, right.minY),
+        std::min(left.minZ, right.minZ),
+        std::max(left.maxX, right.maxX),
+        std::max(left.maxY, right.maxY),
+        std::max(left.maxZ, right.maxZ),
+    };
+}
+
+Bounds3d ExpandBounds(const Bounds3d& bounds, double paddingFactor, double minimumPadding) {
+    const double extentX = bounds.maxX - bounds.minX;
+    const double extentY = bounds.maxY - bounds.minY;
+    const double extentZ = bounds.maxZ - bounds.minZ;
+    const double padX = std::max(minimumPadding, extentX * paddingFactor);
+    const double padY = std::max(minimumPadding, extentY * paddingFactor);
+    const double padZ = std::max(minimumPadding, extentZ * paddingFactor);
+    return {
+        bounds.minX - padX,
+        bounds.minY - padY,
+        bounds.minZ - padZ,
+        bounds.maxX + padX,
+        bounds.maxY + padY,
+        bounds.maxZ + padZ,
+    };
+}
+
+Bounds3d ComputeRbfCenterBounds(const CandidateFit& fit) {
+    Bounds3d bounds{};
+    if (fit.gpuCenters.size() < 12) {
+        return bounds;
+    }
+
+    bounds.minX = bounds.maxX = static_cast<double>(fit.gpuCenters[0]);
+    bounds.minY = bounds.maxY = static_cast<double>(fit.gpuCenters[1]);
+    bounds.minZ = bounds.maxZ = static_cast<double>(fit.gpuCenters[2]);
+    for (std::size_t index = 3; index + 2 < fit.gpuCenters.size(); index += 3) {
+        bounds.minX = std::min(bounds.minX, static_cast<double>(fit.gpuCenters[index]));
+        bounds.minY = std::min(bounds.minY, static_cast<double>(fit.gpuCenters[index + 1]));
+        bounds.minZ = std::min(bounds.minZ, static_cast<double>(fit.gpuCenters[index + 2]));
+        bounds.maxX = std::max(bounds.maxX, static_cast<double>(fit.gpuCenters[index]));
+        bounds.maxY = std::max(bounds.maxY, static_cast<double>(fit.gpuCenters[index + 1]));
+        bounds.maxZ = std::max(bounds.maxZ, static_cast<double>(fit.gpuCenters[index + 2]));
+    }
+    return bounds;
+}
+
+[[maybe_unused]] Bounds3d ComputeReconstructionBounds(const ModelData& source, const CandidateFit& fit) {
+    Bounds3d bounds = ComputeTrimmedVertexBounds(source, 16000);
+    if (fit.method == ConversionMethod::RbfImplicit && fit.gpuCenters.size() >= 12 && fit.gpuRadiusSquared > 0.0f) {
+        const double radius = std::sqrt(static_cast<double>(fit.gpuRadiusSquared));
+        const Bounds3d centerBounds = ExpandBounds(ComputeRbfCenterBounds(fit), 0.0, radius * 2.4);
+        if (HasMeaningfulExtent(centerBounds)) {
+            bounds = MergeBounds(bounds, centerBounds);
+        }
+    }
+
+    if (!HasMeaningfulExtent(bounds)) {
+        bounds = BoundsFromModel(source);
+    }
+
+    return ExpandBounds(bounds, 0.08, std::max(0.015, static_cast<double>(source.scale) * 0.01));
+}
+
+int DeterminePreviewResolution(const ModelData& source, const CandidateFit& fit) {
+    (void)fit;
+    return source.VertexCount() > 10000 ? 28 : (source.VertexCount() > 2500 ? 30 : 32);
 }
 
 std::vector<Vec3d> ComputeVertexNormals(const ModelData& model, const std::vector<Vec3d>& normalizedVertices) {
@@ -1140,6 +1409,49 @@ CandidateFit SolveRequestedFit(
     return {};
 }
 
+CandidateFit ResolveReconstructionAutoFit(
+    const ModelData& model,
+    const std::vector<Vec3d>& vertices,
+    const std::vector<Vec3d>& normalizedVertices,
+    double offsetStepNormalized) {
+    CandidateFit rbf = FitRbfImplicit(model, normalizedVertices, offsetStepNormalized);
+    CandidateFit cubic = FitImplicitPolynomial(model, normalizedVertices, offsetStepNormalized, 3);
+    CandidateFit quadratic = FitImplicitPolynomial(model, normalizedVertices, offsetStepNormalized, 2);
+
+    if (rbf.valid) {
+        const bool cubicMissingOrWeak = !cubic.valid
+            || cubic.rmsResidual > 0.05
+            || cubic.maxResidual > 0.16;
+        const bool rbfBetterThanCubic = !cubic.valid || (rbf.rmsResidual <= cubic.rmsResidual * 1.15);
+        const bool denseOrganicMesh = model.VertexCount() > 1200 || model.TriangleCount() > 2000;
+        if (cubicMissingOrWeak || rbfBetterThanCubic || denseOrganicMesh) {
+            return rbf;
+        }
+    }
+
+    if (cubic.valid) {
+        return cubic;
+    }
+
+    if (quadratic.valid) {
+        return quadratic;
+    }
+
+    return ResolveAutoFit(model, vertices, normalizedVertices, offsetStepNormalized);
+}
+
+[[maybe_unused]] CandidateFit SolveRequestedReconstructionFit(
+    const ModelData& model,
+    ConversionMethod method,
+    const std::vector<Vec3d>& vertices,
+    const std::vector<Vec3d>& normalizedVertices,
+    double offsetStepNormalized) {
+    if (method == ConversionMethod::AutoDetect) {
+        return ResolveReconstructionAutoFit(model, vertices, normalizedVertices, offsetStepNormalized);
+    }
+    return SolveRequestedFit(model, method, vertices, normalizedVertices, offsetStepNormalized);
+}
+
 Vec3d InterpolateIsoPoint(const Vec3d& a, const Vec3d& b, double valueA, double valueB) {
     const double denominator = valueA - valueB;
     const double t = std::abs(denominator) < 1e-12
@@ -1231,7 +1543,7 @@ bool BuildMarchingCubesMesh(
     }
 
     const auto start = std::chrono::steady_clock::now();
-    const int resolution = source.VertexCount() > 10000 ? 28 : (source.VertexCount() > 2500 ? 30 : 32);
+    const int resolution = DeterminePreviewResolution(source, fit);
     outResolution = resolution;
 
     const double padding = std::max(0.06, 0.12);
