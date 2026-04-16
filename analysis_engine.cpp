@@ -1,4 +1,5 @@
 #include "equation_fitter.h"
+#include "gpu_compute.h"
 
 #include <algorithm>
 #include <array>
@@ -42,6 +43,11 @@ struct CandidateFit {
     std::wstring equation;
     std::wstring description;
     std::function<double(const Vec3d&)> evaluator;
+    std::vector<float> gpuCenters;
+    std::vector<float> gpuWeights;
+    float gpuConstant = 0.0f;
+    float gpuRadiusSquared = 0.0f;
+    bool gpuEvaluable = false;
 };
 
 struct FittingSample {
@@ -929,6 +935,17 @@ CandidateFit FitRbfImplicit(const ModelData& model, const std::vector<Vec3d>& no
         }
         return value;
     };
+    fit.gpuCenters.reserve(centers.size() * 3);
+    fit.gpuWeights.reserve(centers.size());
+    for (std::size_t centerIndex = 0; centerIndex < centers.size(); ++centerIndex) {
+        fit.gpuCenters.push_back(static_cast<float>(static_cast<double>(model.center[0]) + centers[centerIndex].x * static_cast<double>(model.scale)));
+        fit.gpuCenters.push_back(static_cast<float>(static_cast<double>(model.center[1]) + centers[centerIndex].y * static_cast<double>(model.scale)));
+        fit.gpuCenters.push_back(static_cast<float>(static_cast<double>(model.center[2]) + centers[centerIndex].z * static_cast<double>(model.scale)));
+        fit.gpuWeights.push_back(static_cast<float>(coefficients[centerIndex]));
+    }
+    fit.gpuConstant = static_cast<float>(coefficients[centers.size()]);
+    fit.gpuRadiusSquared = static_cast<float>((radius * static_cast<double>(model.scale)) * (radius * static_cast<double>(model.scale)));
+    fit.gpuEvaluable = true;
     return fit;
 }
 
@@ -1206,6 +1223,7 @@ bool BuildMarchingCubesMesh(
     ModelData& mesh,
     int& outResolution,
     double& outExtractionMs,
+    std::wstring& outComputeMode,
     std::wstring& errorMessage) {
     if (!fit.evaluator) {
         errorMessage = L"The selected fit could not be sampled for reconstruction.";
@@ -1233,15 +1251,46 @@ bool BuildMarchingCubesMesh(
     };
 
     std::vector<double> values(static_cast<std::size_t>(gridSize) * static_cast<std::size_t>(gridSize) * static_cast<std::size_t>(gridSize), 0.0);
-    for (int z = 0; z < gridSize; ++z) {
-        for (int y = 0; y < gridSize; ++y) {
-            for (int x = 0; x < gridSize; ++x) {
-                const Vec3d point{
-                    minX + stepX * static_cast<double>(x),
-                    minY + stepY * static_cast<double>(y),
-                    minZ + stepZ * static_cast<double>(z),
-                };
-                values[scalarIndex(x, y, z)] = fit.evaluator(point);
+    bool usedGpu = false;
+    if (GpuComputeEnabled() && fit.gpuEvaluable) {
+        GpuRbfFieldRequest request;
+        request.centers = fit.gpuCenters;
+        request.weights = fit.gpuWeights;
+        request.constantTerm = fit.gpuConstant;
+        request.radiusSquared = fit.gpuRadiusSquared;
+        request.minBounds[0] = static_cast<float>(minX);
+        request.minBounds[1] = static_cast<float>(minY);
+        request.minBounds[2] = static_cast<float>(minZ);
+        request.step[0] = static_cast<float>(stepX);
+        request.step[1] = static_cast<float>(stepY);
+        request.step[2] = static_cast<float>(stepZ);
+        request.gridSize = gridSize;
+
+        GpuFieldResult gpuResult;
+        if (EvaluateRbfFieldOnGpu(request, gpuResult) && gpuResult.values.size() == values.size()) {
+            for (std::size_t index = 0; index < values.size(); ++index) {
+                values[index] = gpuResult.values[index];
+            }
+            usedGpu = true;
+            outComputeMode = L"GPU compute (OpenGL 4.3)";
+        } else {
+            outComputeMode = gpuResult.status.empty() ? L"CPU fallback" : L"CPU fallback after GPU attempt";
+        }
+    } else {
+        outComputeMode = GpuComputeEnabled() ? L"CPU (current fit stays on CPU)" : L"CPU";
+    }
+
+    if (!usedGpu) {
+        for (int z = 0; z < gridSize; ++z) {
+            for (int y = 0; y < gridSize; ++y) {
+                for (int x = 0; x < gridSize; ++x) {
+                    const Vec3d point{
+                        minX + stepX * static_cast<double>(x),
+                        minY + stepY * static_cast<double>(y),
+                        minZ + stepZ * static_cast<double>(z),
+                    };
+                    values[scalarIndex(x, y, z)] = fit.evaluator(point);
+                }
             }
         }
     }
@@ -1426,8 +1475,9 @@ MarchingCubesResult GenerateMarchingCubesPreview(const ModelData& model, Convers
 
     int resolution = 0;
     double extractionMilliseconds = 0.0;
+    std::wstring computeMode;
     std::wstring extractionError;
-    if (!BuildMarchingCubesMesh(model, candidate, result.mesh, resolution, extractionMilliseconds, extractionError)) {
+    if (!BuildMarchingCubesMesh(model, candidate, result.mesh, resolution, extractionMilliseconds, computeMode, extractionError)) {
         result.report = result.fit.report + L"\r\n\r\nMarching Cubes\r\n--------------\r\n" + extractionError;
         return result;
     }
@@ -1436,6 +1486,7 @@ MarchingCubesResult GenerateMarchingCubesPreview(const ModelData& model, Convers
     result.report = result.fit.report
         + L"\r\n\r\nMarching Cubes\r\n--------------\r\n"
         + L"Grid: " + std::to_wstring(resolution) + L" x " + std::to_wstring(resolution) + L" x " + std::to_wstring(resolution) + L"\r\n"
+        + L"Field sampling: " + computeMode + L"\r\n"
         + L"Preview vertices: " + std::to_wstring(result.mesh.VertexCount()) + L"\r\n"
         + L"Preview triangles: " + std::to_wstring(result.mesh.TriangleCount()) + L"\r\n"
         + L"Extraction time: " + ToWide(extractionMilliseconds, 2) + L" ms\r\n"
