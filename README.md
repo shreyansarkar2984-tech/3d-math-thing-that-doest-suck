@@ -10,11 +10,11 @@ It is designed as a practical approximation tool:
 - Keeps the main UI minimal with `Insert OBJ`, `Analyze`, and `Marching Cubes`, and moves advanced options into a `Settings` tab.
 - Uses background fitting so the UI remains responsive on modest hardware.
 
-There are now two desktop builds:
+There are now three desktop builds:
 
-- `ModelEquationStudio_full.exe`: keeps the OBJ at full resolution.
-- `ModelEquationStudio_downscaled.exe`: automatically downsamples large OBJ files to `1500` vertices before analysis.
-
+- `normal.exe`: keeps the OBJ at full resolution.
+- `light.exe`: automatically downsamples large OBJ files to `1500` vertices before analysis.
+- `heavy.exe`: uses gpu 
 ## What "convert to an equation" means here
 
 Arbitrary 3D meshes usually cannot be represented exactly by a single short equation.
