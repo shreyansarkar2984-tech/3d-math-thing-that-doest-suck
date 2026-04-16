@@ -20,6 +20,10 @@
 #define MODEL_DOWNSCALE_ENABLED 0
 #endif
 
+#ifndef MODEL_GPU_COMPUTE_ENABLED
+#define MODEL_GPU_COMPUTE_ENABLED 0
+#endif
+
 namespace {
 
 constexpr wchar_t kWindowClassName[] = L"ModelEquationStudioWindow";
@@ -29,6 +33,7 @@ constexpr int kMargin = 16;
 constexpr int kControlHeight = 30;
 constexpr int kPagePadding = 14;
 constexpr bool kDownscaleEnabled = MODEL_DOWNSCALE_ENABLED != 0;
+constexpr bool kGpuComputeEnabled = MODEL_GPU_COMPUTE_ENABLED != 0;
 constexpr std::size_t kDownscaleVertexBudget = 1500;
 
 enum ControlId {
@@ -471,7 +476,7 @@ bool SaveObjMesh(const std::filesystem::path& path, const ModelData& mesh, std::
         return false;
     }
 
-    output << "# Reconstructed mesh exported by Model Equation Studio\n";
+    output << "# Reconstructed mesh export\n";
     output << std::fixed << std::setprecision(6);
     for (std::size_t index = 0; index < mesh.VertexCount(); ++index) {
         const std::size_t offset = index * 3;
@@ -665,7 +670,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     RegisterClassW(&windowClass);
 
-    const wchar_t* title = kDownscaleEnabled ? L"Model Equation Studio Downscaled" : L"Model Equation Studio Full";
+    const wchar_t* title = kGpuComputeEnabled
+        ? L"Heavy"
+        : (kDownscaleEnabled ? L"Light" : L"Normal");
     HWND window = CreateWindowW(kWindowClassName, title, WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 1260, 820, nullptr, nullptr, instance, nullptr);
     if (window == nullptr) {
         return 0;
