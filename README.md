@@ -40,21 +40,6 @@ where:
 
 `cx`, `cy`, `cz`, and `s` are computed from the mesh bounds so the fit is numerically stable.
 
-## Build
-
-The workspace already has `clang++`, so you can build with:
-
-```bat
-build.bat
-```
-
-The executables will be written to a fresh run folder inside `build`, for example:
-
-- `build\run_30204\normal.exe`
-- `build\run_30204\light.exe`
-- `build\run_30204\heavy.exe`
-
-The main source files live in `code\main.cpp`, `code\model.cpp`, `code\analysis.cpp`, `code\gpu.cpp`, and `code\view.cpp`.
 
 ## Notes
 
